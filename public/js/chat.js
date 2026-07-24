@@ -170,6 +170,9 @@ socket.on('disconnect', () => {
 
 socket.on('joined', function(roomname) {
     setConnected(roomname);
+    if (window.location.search.includes('mode=video')) {
+        socket.emit('startVideoCall', { room: roomname });
+    }
 });
 
 socket.on('partnerDisconnected', function() {
