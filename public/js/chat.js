@@ -28,7 +28,8 @@ function enableInput() {
 
 function disableInput() {
     messagebox.disabled = true;
-    inputWrapper.classList.add('opacity-50', 'pointer-events-none');
+    inputWrapper.classList.add('opacity-50');
+    inputWrapper.classList.remove('pointer-events-none');
     sendBtn.classList.add('opacity-50', 'pointer-events-none');
     if (charCounter) {
         charCounter.classList.add('hidden');
@@ -243,6 +244,39 @@ document.querySelector('#find-new-btn').addEventListener('click', function() {
     setWaiting();
     socket.emit('joinroom');
 });
+
+// ─────────────────────────────────────────────────────────────
+//  TOAST POPUP NOTIFICATION (for waiting state feedback)
+// ─────────────────────────────────────────────────────────────
+let toastTimeout;
+function showToast(text) {
+    let toast = document.querySelector('#chat-toast');
+    if (!toast) {
+        toast = document.createElement('div');
+        toast.id = 'chat-toast';
+        toast.className = 'fixed top-20 left-1/2 -translate-x-1/2 z-50 bg-neutral-900 text-white font-medium text-xs sm:text-sm px-4 py-2.5 rounded-xl shadow-xl transition-all duration-300 pointer-events-none opacity-0 border border-neutral-700';
+        document.body.appendChild(toast);
+    }
+    toast.textContent = text;
+    toast.classList.remove('opacity-0', '-translate-y-2');
+    toast.classList.add('opacity-100', 'translate-y-0');
+    
+    clearTimeout(toastTimeout);
+    toastTimeout = setTimeout(() => {
+        toast.classList.remove('opacity-100', 'translate-y-0');
+        toast.classList.add('opacity-0', '-translate-y-2');
+    }, 2500);
+}
+
+if (inputWrapper) {
+    inputWrapper.addEventListener('click', (e) => {
+        if (currentState === 'waiting') {
+            showToast('Waiting for a stranger to connect...');
+        } else if (currentState === 'disconnected') {
+            showToast('Session ended. Click "Next" to find a new stranger.');
+        }
+    });
+}
 
 // Initialize on load
 setWaiting();
