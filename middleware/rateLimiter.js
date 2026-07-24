@@ -1,5 +1,5 @@
 const rateLimit = require("express-rate-limit");
-const { RateLimiterRedis } = require("rate-limiter-flexible");
+const { RateLimiterRedis, RateLimiterMemory } = require("rate-limiter-flexible");
 const { redisClient } = require("../config/redis");
 const logger = require("../config/logger");
 
@@ -12,9 +12,8 @@ const httpLimiter = rateLimit({
   message: { status: 429, message: "Too many requests from this IP, please try again after 15 minutes" },
 });
 
-// Socket.IO Connection Rate Limiter (rate-limiter-flexible + Redis)
-// Limit to 10 connections per minute per IP, block for 5 minutes if exceeded
-const connectionLimiter = new RateLimiterRedis({
+// Socket.IO Connection Rate Limiters
+const connLimiterRedis = new RateLimiterRedis({
   storeClient: redisClient,
   keyPrefix: "ratelimit_conn",
   points: 10,
@@ -22,11 +21,21 @@ const connectionLimiter = new RateLimiterRedis({
   blockDuration: 300,
 });
 
-// Socket.IO Message/Event Rate Limiter
-// Limit to 5 events per second per Socket ID
-const eventLimiter = new RateLimiterRedis({
+const connLimiterMemory = new RateLimiterMemory({
+  points: 10,
+  duration: 60,
+  blockDuration: 300,
+});
+
+// Socket.IO Message/Event Rate Limiters
+const evtLimiterRedis = new RateLimiterRedis({
   storeClient: redisClient,
   keyPrefix: "ratelimit_event",
+  points: 5,
+  duration: 1,
+});
+
+const evtLimiterMemory = new RateLimiterMemory({
   points: 5,
   duration: 1,
 });
@@ -34,12 +43,20 @@ const eventLimiter = new RateLimiterRedis({
 const socketConnectionRateLimiter = async (socket, next) => {
   const ip = socket.handshake.headers["x-forwarded-for"] || socket.handshake.address;
   try {
-    await connectionLimiter.consume(ip);
+    if (redisClient.status === "ready") {
+      await connLimiterRedis.consume(ip);
+    } else {
+      await connLimiterMemory.consume(ip);
+    }
     next();
   } catch (rejRes) {
+    if (rejRes instanceof Error) {
+      logger.warn({ ip, err: rejRes.message }, "Rate limiter encountered an error, allowing connection");
+      return next();
+    }
     logger.warn({ ip }, "Socket connection rate limit exceeded");
     const err = new Error("Too many connections. Please wait 5 minutes.");
-    err.data = { status: 429, retryAfter: Math.round(rejRes.msBeforeNext / 1000) };
+    err.data = { status: 429, retryAfter: Math.round((rejRes.msBeforeNext || 0) / 1000) };
     next(err);
   }
 };
@@ -47,15 +64,20 @@ const socketConnectionRateLimiter = async (socket, next) => {
 const socketEventRateLimiter = (socket, next) => {
   socket.use(async (packet, nextMiddle) => {
     const eventName = packet[0];
-    // Rate limit message sending and room commands
     if (["message", "joinroom", "nextStranger", "startVideoCall"].includes(eventName)) {
       try {
-        await eventLimiter.consume(socket.id);
+        if (redisClient.status === "ready") {
+          await evtLimiterRedis.consume(socket.id);
+        } else {
+          await evtLimiterMemory.consume(socket.id);
+        }
         nextMiddle();
       } catch (rejRes) {
+        if (rejRes instanceof Error) {
+          return nextMiddle();
+        }
         logger.warn({ socketId: socket.id, eventName }, "Socket event rate limit exceeded");
         socket.emit("error_msg", "Rate limit exceeded. Please slow down.");
-        // We reject the event execution by passing an error, which socket.io handles
         nextMiddle(new Error("Rate limit exceeded"));
       }
     } else {

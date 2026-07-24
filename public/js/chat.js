@@ -4,7 +4,10 @@
 // ─────────────────────────────────────────────────────────────
 const socketUrl = window.SOCKET_SERVER_URL || window.location.origin;
 const socket = io(socketUrl, {
-    transports: ['websocket', 'polling']
+    transports: ['polling', 'websocket'],
+    reconnection: true,
+    reconnectionAttempts: 10,
+    reconnectionDelay: 1000
 });
 const messagebox    = document.querySelector('#messagebox');
 const messageContainer = document.querySelector('#message-container');
@@ -220,8 +223,8 @@ function doNext() {
     socket.emit('nextStranger');
 }
 
-document.querySelector('#next-btn').addEventListener('click', doNext);
-document.querySelector('#footer-next-btn').addEventListener('click', doNext);
+document.querySelector('#next-btn')?.addEventListener('click', doNext);
+document.querySelector('#footer-next-btn')?.addEventListener('click', doNext);
 
 // ─────────────────────────────────────────────────────────────
 //  STOP BUTTON (leave chat, go to landing page)

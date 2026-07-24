@@ -1,6 +1,116 @@
 const logger = require("../config/logger");
 const { redisClient } = require("../config/redis");
 
+// In-memory fallback state
+const localActiveSockets = new Set();
+const localQueuedUsers = new Set();
+const localQueue = [];
+const localQueueTimestamps = new Map();
+const localRooms = new Map();
+
+function isRedisReady() {
+  return redisClient && redisClient.status === "ready";
+}
+
+const store = {
+  async addActiveSocket(id) {
+    if (isRedisReady()) {
+      await redisClient.sadd("linkup:active_sockets", id).catch(() => {});
+    }
+    localActiveSockets.add(id);
+  },
+  async removeActiveSocket(id) {
+    if (isRedisReady()) {
+      await redisClient.srem("linkup:active_sockets", id).catch(() => {});
+    }
+    localActiveSockets.delete(id);
+  },
+  async getRoom(id) {
+    if (isRedisReady()) {
+      try {
+        const room = await redisClient.hget("linkup:rooms", id);
+        if (room) return room;
+      } catch (e) {}
+    }
+    return localRooms.get(id) || null;
+  },
+  async setRoom(id, roomname) {
+    if (isRedisReady()) {
+      await redisClient.hset("linkup:rooms", id, roomname).catch(() => {});
+    }
+    localRooms.set(id, roomname);
+  },
+  async delRoom(id) {
+    if (isRedisReady()) {
+      await redisClient.hdel("linkup:rooms", id).catch(() => {});
+    }
+    localRooms.delete(id);
+  },
+  async popQueue() {
+    if (isRedisReady()) {
+      try {
+        const item = await redisClient.rpop("linkup:queue");
+        if (item) return item;
+      } catch (e) {}
+    }
+    return localQueue.pop() || null;
+  },
+  async pushQueue(id) {
+    if (isRedisReady()) {
+      try {
+        await redisClient.sadd("linkup:queued_users", id);
+        await redisClient.lpush("linkup:queue", id);
+        await redisClient.zadd("linkup:queue_timestamps", Date.now(), id);
+      } catch (e) {}
+    }
+    if (!localQueuedUsers.has(id)) {
+      localQueuedUsers.add(id);
+      localQueue.unshift(id);
+      localQueueTimestamps.set(id, Date.now());
+    }
+  },
+  async removeFromQueue(id) {
+    if (isRedisReady()) {
+      try {
+        await redisClient.lrem("linkup:queue", 0, id);
+        await redisClient.srem("linkup:queued_users", id);
+        await redisClient.zrem("linkup:queue_timestamps", id);
+      } catch (e) {}
+    }
+    localQueuedUsers.delete(id);
+    const idx = localQueue.indexOf(id);
+    if (idx !== -1) localQueue.splice(idx, 1);
+    localQueueTimestamps.delete(id);
+  },
+  async isQueued(id) {
+    if (isRedisReady()) {
+      try {
+        const queued = await redisClient.sismember("linkup:queued_users", id);
+        if (queued) return true;
+      } catch (e) {}
+    }
+    return localQueuedUsers.has(id);
+  },
+  async isActive(id) {
+    if (isRedisReady()) {
+      try {
+        const active = await redisClient.sismember("linkup:active_sockets", id);
+        if (active) return true;
+      } catch (e) {}
+    }
+    return localActiveSockets.has(id);
+  },
+  async hasRoom(id) {
+    if (isRedisReady()) {
+      try {
+        const has = await redisClient.hexists("linkup:rooms", id);
+        if (has) return true;
+      } catch (e) {}
+    }
+    return localRooms.has(id);
+  }
+};
+
 async function disbandRoom(io, roomname) {
   if (!roomname) return;
   const ids = roomname.split("-");
@@ -8,8 +118,8 @@ async function disbandRoom(io, roomname) {
     const [id1, id2] = ids;
     io.in(id1).socketsLeave(roomname);
     io.in(id2).socketsLeave(roomname);
-    await redisClient.hdel("linkup:rooms", id1);
-    await redisClient.hdel("linkup:rooms", id2);
+    await store.delRoom(id1);
+    await store.delRoom(id2);
     logger.info({ roomname }, "Room disbanded");
   }
 }
@@ -19,14 +129,15 @@ setInterval(async () => {
   try {
     const now = Date.now();
     const staleTime = now - 60000;
-    const staleUsers = await redisClient.zrangebyscore("linkup:queue_timestamps", 0, staleTime);
-
-    if (staleUsers.length > 0) {
-      logger.info({ count: staleUsers.length }, "Cleaning stale queued users");
+    if (isRedisReady()) {
+      const staleUsers = await redisClient.zrangebyscore("linkup:queue_timestamps", 0, staleTime).catch(() => []);
       for (const userId of staleUsers) {
-        await redisClient.lrem("linkup:queue", 0, userId);
-        await redisClient.srem("linkup:queued_users", userId);
-        await redisClient.zrem("linkup:queue_timestamps", userId);
+        await store.removeFromQueue(userId);
+      }
+    }
+    for (const [userId, ts] of localQueueTimestamps.entries()) {
+      if (ts <= staleTime) {
+        await store.removeFromQueue(userId);
       }
     }
   } catch (err) {
@@ -37,16 +148,15 @@ setInterval(async () => {
 module.exports = function (io) {
   io.on("connection", async function (socket) {
     logger.info({ socketId: socket.id }, "User connected");
-    await redisClient.sadd("linkup:active_sockets", socket.id);
+    await store.addActiveSocket(socket.id);
 
     socket.on("joinroom", async function () {
       try {
-        const room = await redisClient.hget("linkup:rooms", socket.id);
+        const room = await store.getRoom(socket.id);
         if (room) {
           io.in(socket.id).socketsLeave(room);
-          await redisClient.hdel("linkup:rooms", socket.id);
+          await store.delRoom(socket.id);
         }
-
         await matchUser(socket);
       } catch (err) {
         logger.error({ err, socketId: socket.id }, "Error in joinroom");
@@ -55,16 +165,13 @@ module.exports = function (io) {
 
     socket.on("nextStranger", async function () {
       try {
-        const room = await redisClient.hget("linkup:rooms", socket.id);
+        const room = await store.getRoom(socket.id);
         if (room) {
           socket.broadcast.to(room).emit("partnerDisconnected");
           await disbandRoom(io, room);
         } else {
-          await redisClient.lrem("linkup:queue", 0, socket.id);
-          await redisClient.srem("linkup:queued_users", socket.id);
-          await redisClient.zrem("linkup:queue_timestamps", socket.id);
+          await store.removeFromQueue(socket.id);
         }
-
         await matchUser(socket);
       } catch (err) {
         logger.error({ err, socketId: socket.id }, "Error in nextStranger");
@@ -73,7 +180,7 @@ module.exports = function (io) {
 
     socket.on("signalingMessage", async (data) => {
       try {
-        const room = await redisClient.hget("linkup:rooms", socket.id);
+        const room = await store.getRoom(socket.id);
         if (room && room === data.room) {
           socket.broadcast.to(data.room).emit("signalingMessage", data.message);
         }
@@ -84,7 +191,7 @@ module.exports = function (io) {
 
     socket.on("message", async function (data) {
       try {
-        const room = await redisClient.hget("linkup:rooms", socket.id);
+        const room = await store.getRoom(socket.id);
         if (data && room && room === data.room) {
           if (typeof data.message === "string" && data.message.trim().length > 0) {
             if (data.message.length > 1000) {
@@ -101,7 +208,7 @@ module.exports = function (io) {
 
     socket.on("startVideoCall", async function ({ room }) {
       try {
-        const userRoom = await redisClient.hget("linkup:rooms", socket.id);
+        const userRoom = await store.getRoom(socket.id);
         if (userRoom && userRoom === room) {
           socket.broadcast.to(room).emit("incomingCall");
         }
@@ -112,7 +219,7 @@ module.exports = function (io) {
 
     socket.on("rejectCall", async function ({ room }) {
       try {
-        const userRoom = await redisClient.hget("linkup:rooms", socket.id);
+        const userRoom = await store.getRoom(socket.id);
         if (userRoom && userRoom === room) {
           socket.broadcast.to(room).emit("callRejected");
         }
@@ -123,7 +230,7 @@ module.exports = function (io) {
 
     socket.on("acceptCall", async function ({ room }) {
       try {
-        const userRoom = await redisClient.hget("linkup:rooms", socket.id);
+        const userRoom = await store.getRoom(socket.id);
         if (userRoom && userRoom === room) {
           socket.broadcast.to(room).emit("callAccepted");
         }
@@ -135,11 +242,10 @@ module.exports = function (io) {
     socket.on("disconnect", async function () {
       try {
         logger.info({ socketId: socket.id }, "User disconnected");
-        await redisClient.srem("linkup:active_sockets", socket.id);
-        await redisClient.srem("linkup:queued_users", socket.id);
-        await redisClient.zrem("linkup:queue_timestamps", socket.id);
+        await store.removeActiveSocket(socket.id);
+        await store.removeFromQueue(socket.id);
 
-        const room = await redisClient.hget("linkup:rooms", socket.id);
+        const room = await store.getRoom(socket.id);
         if (room) {
           socket.broadcast.to(room).emit("partnerDisconnected");
           await disbandRoom(io, room);
@@ -155,7 +261,7 @@ module.exports = function (io) {
 
       while (!matched && attempts < 10) {
         attempts++;
-        const partnerId = await redisClient.rpop("linkup:queue");
+        const partnerId = await store.popQueue();
         if (!partnerId) {
           break;
         }
@@ -165,21 +271,19 @@ module.exports = function (io) {
         }
 
         const [isActive, hasRoom] = await Promise.all([
-          redisClient.sismember("linkup:active_sockets", partnerId),
-          redisClient.hexists("linkup:rooms", partnerId)
+          store.isActive(partnerId),
+          store.hasRoom(partnerId)
         ]);
 
         if (isActive && !hasRoom) {
           matched = true;
           const roomname = `${s.id}-${partnerId}`;
 
-          await redisClient.hset("linkup:rooms", s.id, roomname);
-          await redisClient.hset("linkup:rooms", partnerId, roomname);
+          await store.setRoom(s.id, roomname);
+          await store.setRoom(partnerId, roomname);
 
-          await redisClient.srem("linkup:queued_users", s.id);
-          await redisClient.srem("linkup:queued_users", partnerId);
-          await redisClient.zrem("linkup:queue_timestamps", s.id);
-          await redisClient.zrem("linkup:queue_timestamps", partnerId);
+          await store.removeFromQueue(s.id);
+          await store.removeFromQueue(partnerId);
 
           io.in(s.id).socketsJoin(roomname);
           io.in(partnerId).socketsJoin(roomname);
@@ -188,16 +292,13 @@ module.exports = function (io) {
           io.to(roomname).emit("joined", roomname);
           return;
         } else {
-          await redisClient.srem("linkup:queued_users", partnerId);
-          await redisClient.zrem("linkup:queue_timestamps", partnerId);
+          await store.removeFromQueue(partnerId);
         }
       }
 
-      const alreadyQueued = await redisClient.sismember("linkup:queued_users", s.id);
+      const alreadyQueued = await store.isQueued(s.id);
       if (!alreadyQueued) {
-        await redisClient.sadd("linkup:queued_users", s.id);
-        await redisClient.lpush("linkup:queue", s.id);
-        await redisClient.zadd("linkup:queue_timestamps", Date.now(), s.id);
+        await store.pushQueue(s.id);
         logger.info({ socketId: s.id }, "User added to queue");
       }
     }

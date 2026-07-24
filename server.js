@@ -16,20 +16,45 @@ const healthRouter = require("./routes/health");
 
 const server = http.createServer(app);
 
-// Configure Socket.IO with Redis Adapter
+// Configure Socket.IO
 const io = socketIo(server, {
   pingTimeout: 60000,   // 60 seconds
   pingInterval: 25000,  // 25 seconds
   cors: {
-    origin: process.env.ALLOWED_ORIGINS 
-      ? process.env.ALLOWED_ORIGINS.split(",") 
-      : ["http://localhost:3000"],
+    origin: (origin, callback) => {
+      if (!origin) return callback(null, true);
+      if (!process.env.ALLOWED_ORIGINS || process.env.ALLOWED_ORIGINS === "*") {
+        return callback(null, true);
+      }
+      const allowedOrigins = process.env.ALLOWED_ORIGINS.split(",").map(o => o.trim());
+      if (allowedOrigins.includes("*") || allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+      return callback(null, true);
+    },
     methods: ["GET", "POST"],
     credentials: true,
   },
 });
 
-io.adapter(createAdapter(pubClient, subClient));
+// Conditionally attach Redis Adapter if Redis is connected
+if (pubClient.status === "ready") {
+  try {
+    io.adapter(createAdapter(pubClient, subClient));
+    logger.info("Redis adapter attached to Socket.IO");
+  } catch (err) {
+    logger.error({ err }, "Failed to attach Redis adapter");
+  }
+} else {
+  pubClient.once("ready", () => {
+    try {
+      io.adapter(createAdapter(pubClient, subClient));
+      logger.info("Redis adapter attached to Socket.IO on ready event");
+    } catch (err) {
+      logger.error({ err }, "Failed to attach Redis adapter on ready event");
+    }
+  });
+}
 
 // Socket.IO Rate Limiters
 io.use(socketConnectionRateLimiter);
