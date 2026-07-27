@@ -132,3 +132,4 @@ TURN_URL=turn:your.turn.server:3478
 ---
 
 <p align="center">Made with ❤️ in India &nbsp;•&nbsp; © 2026 LinkUp</p>
+# LinkUp
